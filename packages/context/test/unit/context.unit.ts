@@ -36,7 +36,7 @@ class TestContext extends Context {
    * Wait until the context event queue is empty or an error is thrown
    */
   waitUntilObserversNotified(): Promise<void> {
-    return this.waitForIdle();
+    return this.waitForObserversNotifiedForPendingEvents(100);
   }
 }
 
@@ -753,7 +753,10 @@ describe('Context', () => {
     it('emits one bind event to matching observers', async () => {
       ctx.bind('foo').to('foo-value');
       await ctx.waitUntilObserversNotified();
-      expect(events).to.eql(['1:foo:foo-value:bind', '2:foo:foo-value:bind']);
+      expect(events).to.eql([
+        'SYNC:foo:foo-value:bind',
+        'ASYNC:foo:foo-value:bind',
+      ]);
       expect(nonMatchingObserverCalled).to.be.false();
     });
 
@@ -762,10 +765,10 @@ describe('Context', () => {
       ctx.bind('xyz').to('xyz-value');
       await ctx.waitUntilObserversNotified();
       expect(events).to.eql([
-        '1:foo:foo-value:bind',
-        '2:foo:foo-value:bind',
-        '1:xyz:xyz-value:bind',
-        '2:xyz:xyz-value:bind',
+        'SYNC:foo:foo-value:bind',
+        'ASYNC:foo:foo-value:bind',
+        'SYNC:xyz:xyz-value:bind',
+        'ASYNC:xyz:xyz-value:bind',
       ]);
     });
 
@@ -775,10 +778,26 @@ describe('Context', () => {
       ctx.unbind('foo');
       await ctx.waitUntilObserversNotified();
       expect(events).to.eql([
-        '1:foo:foo-value:bind',
-        '2:foo:foo-value:bind',
-        '1:foo:foo-value:unbind',
-        '2:foo:foo-value:unbind',
+        'SYNC:foo:foo-value:bind',
+        'ASYNC:foo:foo-value:bind',
+        'SYNC:foo:foo-value:unbind',
+        'ASYNC:foo:foo-value:unbind',
+      ]);
+      expect(nonMatchingObserverCalled).to.be.false();
+    });
+
+    it('emits bind/unbind events for rebind to matching observers', async () => {
+      ctx.bind('foo').to('foo-value');
+      await ctx.waitUntilObserversNotified();
+      ctx.bind('foo').to('new-foo-value');
+      await ctx.waitUntilObserversNotified();
+      expect(events).to.eql([
+        'SYNC:foo:foo-value:bind',
+        'ASYNC:foo:foo-value:bind',
+        'SYNC:foo:foo-value:unbind',
+        'SYNC:foo:new-foo-value:bind',
+        'ASYNC:foo:foo-value:unbind',
+        'ASYNC:foo:new-foo-value:bind',
       ]);
       expect(nonMatchingObserverCalled).to.be.false();
     });
@@ -786,10 +805,16 @@ describe('Context', () => {
     it('does not trigger observers if affected binding is the same', async () => {
       const binding = ctx.bind('foo').to('foo-value');
       await ctx.waitUntilObserversNotified();
-      expect(events).to.eql(['1:foo:foo-value:bind', '2:foo:foo-value:bind']);
+      expect(events).to.eql([
+        'SYNC:foo:foo-value:bind',
+        'ASYNC:foo:foo-value:bind',
+      ]);
       ctx.add(binding);
       await ctx.waitUntilObserversNotified();
-      expect(events).to.eql(['1:foo:foo-value:bind', '2:foo:foo-value:bind']);
+      expect(events).to.eql([
+        'SYNC:foo:foo-value:bind',
+        'ASYNC:foo:foo-value:bind',
+      ]);
     });
 
     it('reports error if an observer fails', () => {
@@ -797,6 +822,38 @@ describe('Context', () => {
       return expect(ctx.waitUntilObserversNotified()).to.be.rejectedWith(
         'something wrong',
       );
+    });
+
+    it('does not trigger observers registered after an event', async () => {
+      ctx.bind('foo').to('foo-value');
+      process.nextTick(() => {
+        // Register a new observer after 1st event
+        const anotherObserver: ContextObserver = {
+          observe: (event, binding, context) => {
+            const val = binding.getValue(context);
+            events.push(`LATE:${binding.key}:${val}:${event}`);
+          },
+        };
+        ctx.subscribe(anotherObserver);
+      });
+
+      await ctx.waitUntilObserversNotified();
+      // The late observer is not triggered
+      expect(events).to.eql([
+        'SYNC:foo:foo-value:bind',
+        'ASYNC:foo:foo-value:bind',
+      ]);
+      // Emit another event
+      ctx.bind('xyz').to('xyz-value');
+      await ctx.waitUntilObserversNotified();
+      // Now the late observer is triggered
+      expect(events).to.eql([
+        'SYNC:foo:foo-value:bind',
+        'ASYNC:foo:foo-value:bind',
+        'SYNC:xyz:xyz-value:bind',
+        'ASYNC:xyz:xyz-value:bind',
+        'LATE:xyz:xyz-value:bind',
+      ]);
     });
 
     function givenObservers() {
@@ -815,7 +872,7 @@ describe('Context', () => {
           // Make sure the binding is configured with value
           // when the observer is notified
           const val = binding.getValue(context);
-          events.push(`1:${binding.key}:${val}:${event}`);
+          events.push(`SYNC:${binding.key}:${val}:${event}`);
         },
       };
       // An async observer matches the criteria
@@ -824,7 +881,7 @@ describe('Context', () => {
         observe: async (event, binding, context) => {
           await setImmediateAsync();
           const val = binding.getValue(context);
-          events.push(`2:${binding.key}:${val}:${event}`);
+          events.push(`ASYNC:${binding.key}:${val}:${event}`);
         },
       };
       // An async observer matches the criteria that throws an error

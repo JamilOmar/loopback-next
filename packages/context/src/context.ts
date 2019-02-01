@@ -89,44 +89,63 @@ export class Context extends EventEmitter {
    * upon `bind` and `unbind` events
    */
   private setupEventHandlers() {
-    // Ideally p-event should allow multiple event types in an iterator
-    this.observeEvent('bind');
-    this.observeEvent('unbind');
+    // The following are two async functions. Returned promises are ignored as
+    // they are long-running background tasks.
+    this.startNotificationTask('bind').catch(err => {
+      // Catch error to avoid lint violations
+      this.emit('error', err);
+    });
+    this.startNotificationTask('unbind').catch(err => {
+      // Catch error to avoid lint violations
+      this.emit('error', err);
+    });
   }
 
   /**
-   * Listen on context events and notify observers
+   * Start a background task to listen on context events and notify observers
    * @param eventType Context event type
    */
-  private async observeEvent(eventType: ContextEventType) {
+  private async startNotificationTask(eventType: ContextEventType) {
+    let currentObservers = this.observers;
     this.on(eventType, () => {
       // Track pending events
       this.pendingEvents++;
+      // Take a snapshot of current observers to ensure notifications of this
+      // event will only be sent to current ones
+      currentObservers = new Set(this.observers);
     });
+    // FIXME(rfeng): p-event should allow multiple event types in an iterator.
     // Create an async iterator from the given event type
     const bindings: AsyncIterable<Readonly<Binding<unknown>>> = pEvent.iterator(
       this,
       eventType,
     );
     for await (const binding of bindings) {
+      // The loop will happen asynchronously upon events
       try {
-        await this.notifyObservers(eventType, binding);
+        // The execution of observers happen in the Promise micro-task queue
+        await this.notifyObservers(eventType, binding, currentObservers);
         this.pendingEvents--;
-        this.emit('idle');
+        this.emit('observersNotified');
       } catch (err) {
         this.pendingEvents--;
+        // Errors caught from observers. Emit it to the current context.
+        // If no error listeners are registered, crash the process.
         this.emit('error', err);
       }
     }
   }
 
   /**
-   * Wait until event notification is idle
+   * Wait until observers are notified for all of currently pending events.
+   *
+   * This method is for test only to perform assertions after observers are
+   * notified for relevant events.
    */
-  protected async waitForIdle() {
+  protected async waitForObserversNotifiedForPendingEvents(timeout?: number) {
     const count = this.pendingEvents;
     if (count === 0) return;
-    await pEvent.multiple(this, 'idle', {count});
+    await pEvent.multiple(this, 'observersNotified', {count, timeout});
   }
 
   /**
@@ -236,14 +255,16 @@ export class Context extends EventEmitter {
    *
    * @param eventType Event names: `bind` or `unbind`
    * @param binding Binding bound or unbound
+   * @param observers Current set of context observers
    */
   protected async notifyObservers(
     eventType: ContextEventType,
     binding: Readonly<Binding<unknown>>,
+    observers = this.observers,
   ) {
-    if (this.observers.size === 0) return;
+    if (observers.size === 0) return;
 
-    for (const observer of this.observers) {
+    for (const observer of observers) {
       if (!observer.filter || observer.filter(binding)) {
         await observer.observe(eventType, binding, this);
       }
